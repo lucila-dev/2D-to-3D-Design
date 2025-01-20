@@ -1,0 +1,65 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap');
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #1a1216;
+  --surface: #241820;
+  --surface2: #2e2229;
+  --border: #4a3540;
+  --text: #fdf2f8;
+  --muted: #d8a8bc;
+  --accent: #e879a9;
+  --accent-hover: #f9a8d4;
+  --danger: #f87171;
+  --radius: 10px;
+  --sidebar-w: 300px;
+  --glow: rgba(232, 121, 169, 0.18);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  background:
+    radial-gradient(ellipse 80% 50% at 10% -10%, rgba(244, 114, 182, 0.16), transparent 55%),
+    radial-gradient(ellipse 60% 40% at 100% 0%, rgba(251, 113, 133, 0.1), transparent 50%),
+    var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+input[type='range'] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+input[type='color'] {
+  width: 100%;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
