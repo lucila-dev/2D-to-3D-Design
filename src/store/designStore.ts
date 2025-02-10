@@ -83,10 +83,8 @@ interface DesignState {
   setLatheSegments: (segments: number) => void;
   setCurrentTool: (tool: DrawTool) => void;
   setSelectedStrokeId: (id: string | null) => void;
-  /** Select a stroke only (not its group). Pass additive=true (shift) to multi-select. */
+  /** Select a stroke; pass additive=true (shift) to multi-select. Groups expand to all members. */
   selectStroke: (id: string | null, additive?: boolean) => void;
-  /** Selection expanded by groupId — use for move/rotate so grouped shapes transform together. */
-  getTransformTargetIds: () => string[];
   setTransformMode: (mode: 'translate' | 'rotate') => void;
   updateStrokeTransform: (
     id: string,
@@ -219,7 +217,7 @@ export const useDesignStore = create<DesignState>((set, get) => ({
   historyIndex: 0,
   currentTool: 'pen',
   brushColor: '#e879a9',
-  brushSize: 12,
+  brushSize: 4,
   material: defaultMaterial,
   lighting: defaultLighting,
   textureDataUrl: null,
@@ -266,34 +264,28 @@ export const useDesignStore = create<DesignState>((set, get) => ({
       if (!id) {
         return { selectedStrokeId: null, selectedStrokeIds: [] };
       }
-      // Select only the clicked shape (not the whole group).
-      // Shift+click adds/removes that one shape for multi-select.
+      const target = s.strokes.find((st) => st.id === id);
+      const groupMembers = target?.groupId
+        ? s.strokes.filter((st) => st.groupId === target.groupId).map((st) => st.id)
+        : [id];
+
       if (!additive) {
-        return { selectedStrokeId: id, selectedStrokeIds: [id] };
+        return { selectedStrokeId: id, selectedStrokeIds: groupMembers };
       }
 
       const setIds = new Set(s.selectedStrokeIds);
-      if (setIds.has(id)) setIds.delete(id);
-      else setIds.add(id);
+      const allSelected = groupMembers.every((gid) => setIds.has(gid));
+      if (allSelected) {
+        groupMembers.forEach((gid) => setIds.delete(gid));
+      } else {
+        groupMembers.forEach((gid) => setIds.add(gid));
+      }
       const next = [...setIds];
       return {
         selectedStrokeId: next.includes(id) ? id : next[next.length - 1] ?? null,
         selectedStrokeIds: next,
       };
     }),
-  /** IDs to move/rotate together: current selection, expanded by group membership. */
-  getTransformTargetIds: () => {
-    const s = get();
-    const ids = new Set(s.selectedStrokeIds);
-    for (const id of s.selectedStrokeIds) {
-      const st = s.strokes.find((x) => x.id === id);
-      if (!st?.groupId) continue;
-      for (const mate of s.strokes) {
-        if (mate.groupId === st.groupId) ids.add(mate.id);
-      }
-    }
-    return [...ids];
-  },
   setTransformMode: (mode) => set({ transformMode: mode }),
   updateStrokeTransform: (id, transform) =>
     set((s) => ({
