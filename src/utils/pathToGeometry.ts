@@ -13,12 +13,9 @@ export function resolveStrokeOptions(
 /** Roundness 0 = box, 1 = fully round (sphere). */
 export function getEffectiveRoundness(stroke: Stroke, globalBevel: number): number {
   if (stroke.conversion?.bevelAmount !== undefined) {
-    const t = THREE.MathUtils.clamp(stroke.conversion.bevelAmount, 0, 1);
-    // Circular freehand / ellipse still resolve to a full sphere when roundness is maxed
-    if (t >= 0.98 && isRoundShape(stroke, t)) return 1;
-    return t;
+    return THREE.MathUtils.clamp(stroke.conversion.bevelAmount, 0, 1);
   }
-  if (stroke.tool === 'ellipse' || isRoundShape(stroke, globalBevel)) return 1;
+  if (stroke.tool === 'ellipse' || isRoundShape(stroke)) return 1;
   return THREE.MathUtils.clamp(globalBevel, 0, 1);
 }
 
@@ -65,34 +62,15 @@ function strokeCentroid(stroke: Stroke): Point {
 function toDotGeometry(stroke: Stroke, options: ConversionOptions): THREE.BufferGeometry {
   const c = strokeCentroid(stroke);
   const center = toShapeSpace(c);
-  // Match 2D filled-circle diameter (stroke.width) in world units
-  const size = Math.max((stroke.width / CANVAS_SIZE) * 2, 0.04);
-  const t = getEffectiveRoundness(stroke, options.bevelAmount);
+  // Match 2D filled-circle radius (stroke.width / 2) in world units
+  const r = Math.max((stroke.width / CANVAS_SIZE), 0.035);
   const hollow = Boolean(options.hollow);
-
   if (hollow) {
-    const geom =
-      t >= 0.5
-        ? hollowRoundGeometry(size, size, size, 0.28)
-        : hollowBoxGeometry(size, size, size, 0.22);
+    const geom = hollowRoundGeometry(r * 2, r * 2, r * 2, 0.28);
     geom.translate(center.x, center.y, 0);
     return geom;
   }
-
-  // 0% round edges → cube; 100% → sphere; in-between → rounded cube
-  if (t <= 0.02) {
-    const geom = new THREE.BoxGeometry(size, size, size);
-    geom.translate(center.x, center.y, 0);
-    return geom;
-  }
-  if (t >= 0.98) {
-    const geom = new THREE.SphereGeometry(size / 2, 20, 16);
-    geom.translate(center.x, center.y, 0);
-    return geom;
-  }
-  const maxR = size * 0.5;
-  const radius = Math.min(Math.max(t * maxR, 0.001), maxR * 0.999);
-  const geom = new RoundedBoxGeometry(size, size, size, 6, radius);
+  const geom = new THREE.SphereGeometry(r, 20, 16);
   geom.translate(center.x, center.y, 0);
   return geom;
 }
@@ -185,66 +163,55 @@ function maxDeviationFromAxis(points: Point[], a: Point, b: Point): number {
   return maxDev;
 }
 
-/**
- * True for ellipse tool and freehand blobs that read as a circle/ellipse.
- * High round-edges (bevelAmount) slightly relaxes thresholds so near-circles
- * with Round edges at 100% become spheres instead of flat extrusions.
- */
-function isRoundShape(stroke: Stroke, bevelAmount = 0): boolean {
+function isRoundShape(stroke: Stroke): boolean {
   if (stroke.tool === 'ellipse') return true;
-  if (stroke.tool === 'rect' || stroke.tool === 'line') return false;
-  // Only treat freehand as a circle when it's clearly circular
-  if (stroke.points.length < 8) return false;
-
-  const roundBias = THREE.MathUtils.clamp(bevelAmount, 0, 1);
-  const aspectThresh = THREE.MathUtils.lerp(1.28, 1.42, roundBias);
-  const circThresh = THREE.MathUtils.lerp(0.85, 0.75, roundBias);
+  if (stroke.tool === 'rect') return false;
+  if (stroke.points.length < 5) return false;
 
   const { w, h, aspect } = strokeBounds(stroke);
-  if (aspect > aspectThresh) return false;
+  if (aspect > 1.65) return false;
 
   const area = polygonArea(stroke.points);
   const peri = perimeter(stroke.points);
   if (peri < 1) return false;
 
-  // Perfect circle: circularity = 1, fillRatio ≈ π/4 ≈ 0.785
   const circularity = (4 * Math.PI * area) / (peri * peri);
   const fillRatio = area / (w * h);
 
-  return circularity >= circThresh && fillRatio >= 0.5 && fillRatio <= 0.95;
-}
-
-/** Closed / nearly-closed freehand that should keep its silhouette in 3D. */
-function isFilledSilhouette(stroke: Stroke): boolean {
-  if (stroke.points.length < 3) return false;
-  if (stroke.closed) return true;
-
-  const { w, h } = strokeBounds(stroke);
-  const { dist } = farthestPair(stroke.points);
-  const endGap = Math.hypot(
-    stroke.points[0].x - stroke.points[stroke.points.length - 1].x,
-    stroke.points[0].y - stroke.points[stroke.points.length - 1].y,
-  );
-  // Loop almost closed → treat as filled shape
-  if (endGap < Math.max(dist * 0.4, Math.min(w, h) * 0.35, stroke.width * 3)) {
+  // Circle: circularity ≈ 1.0, fill ≈ 0.785
+  if (circularity >= 0.72 && fillRatio <= 0.92 && aspect <= 1.45) return true;
+  // Loose hand-drawn loop
+  if (circularity >= 0.55 && fillRatio >= 0.35 && fillRatio <= 0.88 && aspect <= 1.4) {
     return true;
-  }
-
-  // Fat scribble that fills its bbox — still a silhouette, not a stick
-  if (stroke.points.length >= 6) {
-    const area = polygonArea(stroke.points);
-    const fillRatio = area / (w * h);
-    if (fillRatio >= 0.22) return true;
   }
 
   return false;
 }
 
+function isRectangular(stroke: Stroke): boolean {
+  if (stroke.tool === 'rect') return true;
+  if (stroke.points.length < 4) return false;
+
+  const { w, h, aspect } = strokeBounds(stroke);
+  if (aspect > 4) return false;
+
+  const area = polygonArea(stroke.points);
+  const peri = perimeter(stroke.points);
+  if (peri < 1) return false;
+
+  const circularity = (4 * Math.PI * area) / (peri * peri);
+  const fillRatio = area / (w * h);
+
+  // Don't call a circle a rectangle
+  if (circularity >= 0.85) return false;
+
+  // Squares/blocks fill most of their bounding box
+  return fillRatio >= 0.86;
+}
+
 function isLineLikeStroke(stroke: Stroke): boolean {
   if (stroke.tool === 'line') return true;
   if (stroke.points.length < 2) return false;
-  // Never treat a filled silhouette as a stick
-  if (isFilledSilhouette(stroke)) return false;
 
   const { w, h, aspect } = strokeBounds(stroke);
   const { a, b, dist: best } = farthestPair(stroke.points);
@@ -252,10 +219,10 @@ function isLineLikeStroke(stroke: Stroke): boolean {
   if (pathLen < 2) return false;
 
   const maxDev = maxDeviationFromAxis(stroke.points, a, b);
-  const thinEnough = maxDev <= Math.max(stroke.width * 2.2, best * 0.18, 6);
+  const thinEnough = maxDev <= Math.max(stroke.width * 2.2, best * 0.2, 8);
 
   // Stick / limb: thin along a main axis
-  if (thinEnough && (aspect >= 1.6 || best > pathLen * 0.6)) return true;
+  if (thinEnough && (aspect >= 1.45 || best > pathLen * 0.55)) return true;
 
   // Open pen stroke that doesn't close into a blob
   if (!stroke.closed && stroke.tool === 'pen') {
@@ -263,13 +230,13 @@ function isLineLikeStroke(stroke: Stroke): boolean {
       stroke.points[0].x - stroke.points[stroke.points.length - 1].x,
       stroke.points[0].y - stroke.points[stroke.points.length - 1].y,
     );
-    if (endGap > best * 0.4 && thinEnough) return true;
+    if (endGap > best * 0.35 && thinEnough) return true;
   }
 
   if (stroke.points.length >= 3) {
     const area = polygonArea(stroke.points);
     const fillRatio = area / (w * h);
-    if (fillRatio < 0.18 && aspect >= 1.5) return true;
+    if (fillRatio < 0.28 && aspect >= 1.35) return true;
   }
 
   return false;
@@ -311,23 +278,14 @@ function resolveDepth(
   }
 }
 
-/**
- * Prefer faithful silhouette extrusion for irregular freehand drawings.
- * Circular freehand / ellipse / dots → sphere; rect → box; thin strokes → capsule.
- */
-function classifyStroke(
-  stroke: Stroke,
-  config: AssetTypeConfig,
-  mode: 'extrude' | 'lathe',
-  options: ConversionOptions,
-): ShapeRole {
+function classifyStroke(stroke: Stroke, config: AssetTypeConfig, mode: 'extrude' | 'lathe'): ShapeRole {
   if (isDotStroke(stroke)) return 'sphere';
 
   if (mode === 'lathe' && config.id === 'jewellery' && stroke.tool !== 'line') {
     return 'lathe';
   }
 
-  // Explicit shape tools
+  // Explicit tools win first
   if (stroke.tool === 'ellipse') return 'sphere';
   if (stroke.tool === 'rect') {
     const { aspect } = strokeBounds(stroke);
@@ -340,25 +298,34 @@ function classifyStroke(
     return 'box';
   }
 
-  if (stroke.tool === 'line') return 'capsule';
+  if (stroke.tool === 'line' || isLineLikeStroke(stroke)) return 'capsule';
 
-  // Near-circular freehand → sphere (before the generic silhouette extrude path)
-  const bevel =
-    stroke.conversion?.bevelAmount !== undefined
-      ? stroke.conversion.bevelAmount
-      : options.bevelAmount;
-  if (isRoundShape(stroke, bevel)) return 'sphere';
+  // Round before blocky — circles fill ~78% of bbox and used to look "rectangular"
+  if (isRoundShape(stroke)) return 'sphere';
 
-  // Irregular filled freehand: keep the drawn outline as an extruded silhouette
-  if (stroke.tool === 'pen' && isFilledSilhouette(stroke)) {
-    return 'extrude';
+  if (isRectangular(stroke)) {
+    const { aspect } = strokeBounds(stroke);
+    if (
+      aspect >= 2.2 &&
+      (config.id === 'characters' || config.id === 'plushies')
+    ) {
+      return 'capsule';
+    }
+    return 'box';
   }
-
-  if (isLineLikeStroke(stroke)) return 'capsule';
-
-  // Open freehand path (rope / antenna / outline stroke)
-  if (stroke.tool === 'pen' && !stroke.closed && stroke.points.length >= 4) {
-    return 'tube';
+  // Open freehand that isn't a stick → tube (rope / antenna / outline)
+  if (
+    stroke.tool === 'pen' &&
+    !stroke.closed &&
+    stroke.points.length >= 4 &&
+    !isLineLikeStroke(stroke)
+  ) {
+    const { dist } = farthestPair(stroke.points);
+    const endGap = Math.hypot(
+      stroke.points[0].x - stroke.points[stroke.points.length - 1].x,
+      stroke.points[0].y - stroke.points[stroke.points.length - 1].y,
+    );
+    if (endGap > dist * 0.25) return 'tube';
   }
 
   return 'extrude';
@@ -482,13 +449,11 @@ function toBoxSphereMorph(
   const sz = Math.max(resolveDepth(stroke, config, options), 0.05);
   const hollow = Boolean(options.hollow);
 
-  const roundLike = stroke.tool === 'ellipse' || isRoundShape(stroke, t);
-
   if (hollow) {
-    const geom =
-      t >= 0.72 || roundLike
-        ? hollowRoundGeometry(sx, sy, sz)
-        : hollowBoxGeometry(sx, sy, sz);
+    const roundLike = t >= 0.72 || stroke.tool === 'ellipse' || isRoundShape(stroke);
+    const geom = roundLike
+      ? hollowRoundGeometry(sx, sy, sz)
+      : hollowBoxGeometry(sx, sy, sz);
     geom.translate(center.x, center.y, 0);
     return geom;
   }
@@ -499,11 +464,9 @@ function toBoxSphereMorph(
     return geom;
   }
 
-  if (t >= 0.98 && roundLike) {
-    // Match Z to the 2D footprint so circular blobs read as balls, not flat discs
-    const ballZ = Math.max(sz, Math.min(sx, sy));
+  if (t >= 0.98 && (stroke.tool === 'ellipse' || isRoundShape(stroke))) {
     const geom = new THREE.SphereGeometry(1, 28, 20);
-    geom.scale(sx / 2, sy / 2, ballZ / 2);
+    geom.scale(sx / 2, sy / 2, sz / 2);
     geom.translate(center.x, center.y, 0);
     return geom;
   }
@@ -523,7 +486,7 @@ function toCapsuleGeometry(stroke: Stroke, limbThickness: number): THREE.BufferG
   const dy = B.y - A.y;
   const len = Math.hypot(dx, dy) || 0.05;
 
-  const radius = Math.max((stroke.width / CANVAS_SIZE) * 1.75 * limbThickness, 0.008);
+  const radius = Math.max((stroke.width / CANVAS_SIZE) * 1.75 * limbThickness, 0.025);
   const geom = new THREE.CapsuleGeometry(radius, Math.max(len - radius * 2, 0.02), 5, 10);
   const angle = Math.atan2(dy, dx) - Math.PI / 2;
   geom.rotateZ(angle);
@@ -538,7 +501,7 @@ function toTubeGeometry(stroke: Stroke, limbThickness: number): THREE.BufferGeom
     return new THREE.Vector3(v.x, v.y, 0);
   });
   const curve = new THREE.CatmullRomCurve3(pts);
-  const radius = Math.max((stroke.width / CANVAS_SIZE) * 1.2 * limbThickness, 0.006);
+  const radius = Math.max((stroke.width / CANVAS_SIZE) * 1.2 * limbThickness, 0.02);
   return new THREE.TubeGeometry(curve, Math.min(stroke.points.length * 2, 64), radius, 8, false);
 }
 
@@ -604,7 +567,7 @@ function strokeToGeometry(
   options: ConversionOptions,
   latheSegments: number,
 ): THREE.BufferGeometry | null {
-  const role = classifyStroke(stroke, config, mode, options);
+  const role = classifyStroke(stroke, config, mode);
   const d = resolveDepth(stroke, config, options);
   let geom: THREE.BufferGeometry | null = null;
 
@@ -629,11 +592,14 @@ function strokeToGeometry(
       geom = toLatheGeometry(stroke, latheSegments);
       break;
     case 'extrude': {
-      // Always extrude the drawn silhouette (force-close so outline matches 2D fill)
-      const shape =
-        stroke.points.length >= 3
-          ? strokeToShape({ ...stroke, closed: true })
-          : null;
+      let shape: THREE.Shape | null = null;
+      if (stroke.closed && stroke.points.length >= 3) {
+        shape = strokeToShape(stroke);
+      } else if (stroke.tool === 'pen' && stroke.points.length >= 3) {
+        shape = strokeToShape({ ...stroke, closed: true });
+      } else if (stroke.tool === 'rect' || stroke.tool === 'ellipse') {
+        shape = strokeToShape({ ...stroke, closed: true });
+      }
       if (!shape) {
         geom = toCapsuleGeometry(stroke, options.limbThickness);
         break;
@@ -641,12 +607,7 @@ function strokeToGeometry(
       if (mode === 'lathe' && config.id === 'jewellery') {
         geom = toLatheGeometry(stroke, latheSegments);
       } else {
-        // Softer bevel on freehand so the outline stays recognizable
-        const bevel =
-          stroke.tool === 'pen'
-            ? Math.min(options.bevelAmount, 0.35)
-            : options.bevelAmount;
-        geom = softExtrude(shape, config, d, bevel, Boolean(options.hollow));
+        geom = softExtrude(shape, config, d, options.bevelAmount, Boolean(options.hollow));
       }
       break;
     }
