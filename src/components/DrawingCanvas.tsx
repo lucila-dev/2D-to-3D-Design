@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useDesignStore } from '../store/designStore';
 import {
   CANVAS_SIZE,
+  brushPctToWidth,
   buildShapePoints,
   renderAllStrokes,
   drawStroke,
@@ -114,6 +115,7 @@ export function DrawingCanvas() {
 
   const startStrokeAt = (pos: Point) => {
     const { currentTool, brushColor, brushSize, addStroke } = useDesignStore.getState();
+    const width = brushPctToWidth(brushSize);
     drawingRef.current = true;
     pendingSelectRef.current = null;
     startPointRef.current = pos;
@@ -123,7 +125,7 @@ export function DrawingCanvas() {
       const id = addStroke({
         points: [pos],
         color: currentTool === 'eraser' ? 'transparent' : brushColor,
-        width: currentTool === 'eraser' ? brushSize * 3 : brushSize,
+        width: currentTool === 'eraser' ? width * 3 : width,
         tool: currentTool,
         closed: false,
       });
@@ -132,7 +134,7 @@ export function DrawingCanvas() {
       const id = addStroke({
         points: buildShapePoints(currentTool, pos, pos),
         color: brushColor,
-        width: brushSize,
+        width,
         tool: currentTool,
         closed: currentTool !== 'line',
       });
@@ -178,9 +180,10 @@ export function DrawingCanvas() {
       if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) return;
       moveTotalRef.current.x += dx;
       moveTotalRef.current.y += dy;
-      const ids = useDesignStore.getState().selectedStrokeIds;
+      const store = useDesignStore.getState();
+      const ids = store.getTransformTargetIds();
       if (ids.length > 0) {
-        useDesignStore.getState().translateStrokes(ids, dx, dy, false);
+        store.translateStrokes(ids, dx, dy, false);
         paintFrame();
       }
       return;
@@ -198,6 +201,7 @@ export function DrawingCanvas() {
 
     if (!drawingRef.current || !activeIdRef.current) return;
     const { currentTool, brushColor, brushSize, updateStroke } = useDesignStore.getState();
+    const width = brushPctToWidth(brushSize);
 
     if (currentTool === 'pen' || currentTool === 'eraser') {
       const last = activePointsRef.current[activePointsRef.current.length - 1];
@@ -210,7 +214,7 @@ export function DrawingCanvas() {
         id: 'preview',
         points: activePointsRef.current,
         color: currentTool === 'eraser' ? 'transparent' : brushColor,
-        width: currentTool === 'eraser' ? brushSize * 3 : brushSize,
+        width: currentTool === 'eraser' ? width * 3 : width,
         tool: currentTool,
         closed: false,
       });
@@ -222,7 +226,7 @@ export function DrawingCanvas() {
         id: 'preview',
         points: pts,
         color: brushColor,
-        width: brushSize,
+        width,
         tool: currentTool,
         closed: currentTool !== 'line',
       });
@@ -253,28 +257,26 @@ export function DrawingCanvas() {
     if (!drawingRef.current) return;
     const id = activeIdRef.current;
     const pts = activePointsRef.current;
-    const { currentTool, finalizeStroke, setSelectedStrokeId } = useDesignStore.getState();
+    const { currentTool, finalizeStroke } = useDesignStore.getState();
 
     if (id) {
       if (currentTool === 'pen' || currentTool === 'eraser') {
         let shouldClose = false;
-        if (currentTool === 'pen' && pts.length >= 6) {
+        if (currentTool === 'pen' && pts.length >= 4) {
           const xs = pts.map((p) => p.x);
           const ys = pts.map((p) => p.y);
           const w = Math.max(...xs) - Math.min(...xs) || 1;
           const h = Math.max(...ys) - Math.min(...ys) || 1;
-          const aspect = Math.max(w, h) / Math.min(w, h);
           const closeGap = Math.hypot(
             pts[pts.length - 1].x - pts[0].x,
             pts[pts.length - 1].y - pts[0].y,
           );
-          shouldClose = aspect < 1.6 && closeGap < Math.min(w, h) * 0.45;
+          // Close into a filled shape whenever the stroke loops back near the start
+          shouldClose = closeGap < Math.max(Math.min(w, h) * 0.55, brushPctToWidth(useDesignStore.getState().brushSize) * 4, 18);
         }
         finalizeStroke(id, shouldClose);
-        if (currentTool !== 'eraser') setSelectedStrokeId(id);
       } else if (currentTool === 'line' && pts.length >= 2) {
         finalizeStroke(id, true);
-        setSelectedStrokeId(id);
       } else if (currentTool === 'rect' || currentTool === 'ellipse') {
         const xs = pts.map((p) => p.x);
         const ys = pts.map((p) => p.y);
@@ -284,7 +286,6 @@ export function DrawingCanvas() {
           useDesignStore.getState().removeStroke(id);
         } else {
           finalizeStroke(id, true);
-          setSelectedStrokeId(id);
         }
       }
     }

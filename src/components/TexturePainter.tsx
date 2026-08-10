@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useDesignStore } from '../store/designStore';
+import { brushPctToWidth } from '../utils/drawingUtils';
 
 const TEX_SIZE = 512;
 
@@ -43,9 +44,10 @@ export function TexturePainter() {
 
   const paint = (x: number, y: number) => {
     const ctx = canvasRef.current!.getContext('2d')!;
+    const r = brushPctToWidth(brushSize) * 1.5;
     ctx.fillStyle = brushColor;
     ctx.beginPath();
-    ctx.arc(x, y, brushSize * 2, 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fill();
   };
 

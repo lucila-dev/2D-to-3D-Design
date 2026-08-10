@@ -1,5 +1,5 @@
 import { Component, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Canvas, useLoader, useThree, type ThreeEvent } from '@react-three/fiber';
+import { Canvas, createPortal, useLoader, useThree, type ThreeEvent } from '@react-three/fiber';
 import {
   OrbitControls,
   Grid,
@@ -305,7 +305,7 @@ function AiModel({
 
 function applyDeltaToSelection(
   primaryId: string,
-  selectedStrokeIds: string[],
+  targetIds: string[],
   meshRefs: Map<string, THREE.Mesh>,
   dragStart: Map<string, { position: THREE.Vector3; rotation: THREE.Euler }>,
   primaryStart: { position: THREE.Vector3; rotation: THREE.Euler },
@@ -317,7 +317,7 @@ function applyDeltaToSelection(
     primary.rotation.y - primaryStart.rotation.y,
     primary.rotation.z - primaryStart.rotation.z,
   );
-  for (const id of selectedStrokeIds) {
+  for (const id of targetIds) {
     if (id === primaryId) continue;
     const mesh = meshRefs.get(id);
     const start = dragStart.get(id);
@@ -335,10 +335,42 @@ function applyDeltaToSelection(
   }
 }
 
-/** Big center grabber — free drag, no axis lines. */
+/** Prefer the smallest (innermost) stroke among raycast hits. */
+function pickInnermostStrokeId(
+  intersections: { object: THREE.Object3D }[],
+  strokeById: Map<string, Stroke>,
+  fallbackId: string,
+): string {
+  const candidates: { id: string; area: number }[] = [];
+  const seen = new Set<string>();
+  for (const hit of intersections) {
+    const id = hit.object.userData?.strokeId as string | undefined;
+    if (!id || seen.has(id)) continue;
+    const stroke = strokeById.get(id);
+    if (!stroke) continue;
+    seen.add(id);
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of stroke.points) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+    const area = Math.max(0, maxX - minX) * Math.max(0, maxY - minY);
+    candidates.push({ id, area });
+  }
+  if (candidates.length === 0) return fallbackId;
+  candidates.sort((a, b) => a.area - b.area);
+  return candidates[0].id;
+}
+
+/** Compact center grabber — free drag, no axis lines. Portaled out of Bounds so it never affects framing. */
 function MoveHandle({
   primaryId,
-  selectedStrokeIds,
+  targetIds,
   meshRefs,
   primaryRef,
   draggingRef,
@@ -347,7 +379,7 @@ function MoveHandle({
   onCommit,
 }: {
   primaryId: string;
-  selectedStrokeIds: string[];
+  targetIds: string[];
   meshRefs: React.MutableRefObject<Map<string, THREE.Mesh>>;
   primaryRef: React.MutableRefObject<THREE.Mesh | null>;
   draggingRef: React.MutableRefObject<boolean>;
@@ -357,38 +389,70 @@ function MoveHandle({
   primaryStartRef: React.MutableRefObject<{ position: THREE.Vector3; rotation: THREE.Euler }>;
   onCommit: () => void;
 }) {
-  const { camera, gl, controls } = useThree();
+  const { camera, gl, controls, scene } = useThree();
   const handleRef = useRef<THREE.Mesh>(null);
   const planeRef = useRef(new THREE.Plane());
   const hitRef = useRef(new THREE.Vector3());
   const offsetRef = useRef(new THREE.Vector3());
   const pointerIdRef = useRef<number | null>(null);
   const centerLocalRef = useRef(new THREE.Vector3());
+  const towardCamRef = useRef(new THREE.Vector3());
+  const sizeRef = useRef(new THREE.Vector3());
 
-  const getGrabPoint = () => {
+  const getSelectionBox = () => {
     const primary = primaryRef.current;
     if (!primary) return null;
     primary.updateWorldMatrix(true, false);
     const box = new THREE.Box3().setFromObject(primary);
-    if (box.isEmpty()) return primary.getWorldPosition(new THREE.Vector3());
+    if (box.isEmpty()) return null;
+    return box;
+  };
+
+  const getGrabPoint = () => {
+    const primary = primaryRef.current;
+    if (!primary) return null;
+    const box = getSelectionBox();
+    if (!box) return primary.getWorldPosition(new THREE.Vector3());
     return box.getCenter(new THREE.Vector3());
   };
 
-  // Keep handle on the visual center of the selection
+  const placeHandle = () => {
+    const handle = handleRef.current;
+    const primary = primaryRef.current;
+    if (!handle || !primary) return;
+    const box = getSelectionBox();
+    const center = box?.getCenter(new THREE.Vector3()) ?? primary.getWorldPosition(new THREE.Vector3());
+    const span = box
+      ? Math.max(box.getSize(sizeRef.current).x, sizeRef.current.y, sizeRef.current.z, 0.05)
+      : 0.25;
+    const dist = camera.position.distanceTo(center);
+    // Screen-readable but always smaller than the selection — never a giant disc
+    const s = THREE.MathUtils.clamp(Math.min(dist * 0.018, span * 0.18), 0.04, 0.16);
+    towardCamRef.current.copy(camera.position).sub(center).normalize();
+    handle.position.copy(center).addScaledVector(towardCamRef.current, span * 0.12 + s * 0.6);
+    handle.scale.setScalar(s);
+  };
+
+  // Keep handle on the front of the selection
   useEffect(() => {
     let frame = 0;
     const tick = () => {
       const handle = handleRef.current;
       const primary = primaryRef.current;
       if (handle && primary) {
-        const center = getGrabPoint();
-        if (center) {
-          handle.position.copy(center);
-          const dist = camera.position.distanceTo(center);
-          // Large, easy-to-grab handle (screen-relative)
-          const s = Math.max(dist * 0.08, 0.35);
-          handle.scale.setScalar(s);
-        }
+        primary.updateWorldMatrix(true, false);
+        const box = new THREE.Box3().setFromObject(primary);
+        const center = box.isEmpty()
+          ? primary.getWorldPosition(new THREE.Vector3())
+          : box.getCenter(new THREE.Vector3());
+        const span = box.isEmpty()
+          ? 0.25
+          : Math.max(box.getSize(sizeRef.current).x, sizeRef.current.y, sizeRef.current.z, 0.05);
+        const dist = camera.position.distanceTo(center);
+        const s = THREE.MathUtils.clamp(Math.min(dist * 0.018, span * 0.18), 0.04, 0.16);
+        towardCamRef.current.copy(camera.position).sub(center).normalize();
+        handle.position.copy(center).addScaledVector(towardCamRef.current, span * 0.12 + s * 0.6);
+        handle.scale.setScalar(s);
       }
       frame = requestAnimationFrame(tick);
     };
@@ -409,7 +473,7 @@ function MoveHandle({
     primaryStartRef.current.position.copy(primary.position);
     primaryStartRef.current.rotation.copy(primary.rotation);
     dragStartRef.current.clear();
-    for (const id of selectedStrokeIds) {
+    for (const id of targetIds) {
       const mesh = meshRefs.current.get(id);
       if (!mesh) continue;
       dragStartRef.current.set(id, {
@@ -447,14 +511,11 @@ function MoveHandle({
     if (!e.ray.intersectPlane(planeRef.current, hitRef.current)) return;
 
     primary.position.copy(hitRef.current).add(offsetRef.current);
-    if (handleRef.current) {
-      const center = getGrabPoint();
-      if (center) handleRef.current.position.copy(center);
-    }
+    placeHandle();
 
     applyDeltaToSelection(
       primaryId,
-      selectedStrokeIds,
+      targetIds,
       meshRefs.current,
       dragStartRef.current,
       primaryStartRef.current,
@@ -480,7 +541,7 @@ function MoveHandle({
     }
   };
 
-  return (
+  return createPortal(
     <mesh
       ref={handleRef}
       onPointerDown={beginDrag}
@@ -490,15 +551,16 @@ function MoveHandle({
       renderOrder={1000}
       frustumCulled={false}
     >
-      <sphereGeometry args={[1, 28, 20]} />
+      <sphereGeometry args={[1, 20, 16]} />
       <meshBasicMaterial
-        color="#ff8fc4"
+        color="#ff4fa3"
         transparent
-        opacity={0.7}
-        depthTest={false}
+        opacity={0.92}
+        depthTest
         depthWrite={false}
       />
-    </mesh>
+    </mesh>,
+    scene,
   );
 }
 
@@ -533,6 +595,7 @@ function DesignMesh() {
     material,
     physicsEnabled,
     autoRotate,
+    getTransformTargetIds,
   } = useDesignStore();
 
   const { controls } = useThree();
@@ -541,6 +604,10 @@ function DesignMesh() {
     (selectedStrokeId && selectedStrokeIds.includes(selectedStrokeId)
       ? selectedStrokeId
       : selectedStrokeIds[0]) ?? null;
+  const transformTargetIds = useMemo(
+    () => getTransformTargetIds(),
+    [getTransformTargetIds, selectedStrokeIds, strokes],
+  );
 
   const parts = useMemo(
     () =>
@@ -578,13 +645,6 @@ function DesignMesh() {
     setPrimaryMesh((prev) => (prev === mesh ? prev : mesh));
   }, [primaryId, parts]);
 
-  // Auto-select the only shape so the Move handle appears immediately
-  useEffect(() => {
-    if (parts.length === 1 && selectedStrokeIds.length === 0) {
-      useDesignStore.getState().selectStroke(parts[0].strokeId);
-    }
-  }, [parts, selectedStrokeIds.length]);
-
   // Keep mesh transforms in sync with store when not dragging
   useEffect(() => {
     if (draggingRef.current) return;
@@ -613,7 +673,7 @@ function DesignMesh() {
     const primary = primaryRef.current;
     if (!primary || !primaryId) return;
 
-    const updates = selectedStrokeIds
+    const updates = transformTargetIds
       .map((id) => {
         const mesh = meshRefs.current.get(id);
         if (!mesh) return null;
@@ -650,8 +710,10 @@ function DesignMesh() {
         return (
           <mesh
             key={part.strokeId}
+            userData={{ strokeId: part.strokeId }}
             ref={(node) => {
               if (node) {
+                node.userData.strokeId = part.strokeId;
                 meshRefs.current.set(part.strokeId, node);
                 if (!draggingRef.current) {
                   node.position.set(tf.position[0], tf.position[1], tf.position[2]);
@@ -674,7 +736,8 @@ function DesignMesh() {
             receiveShadow
             onPointerDown={(e) => {
               e.stopPropagation();
-              useDesignStore.getState().selectStroke(part.strokeId, e.nativeEvent.shiftKey);
+              const id = pickInnermostStrokeId(e.intersections, strokeById, part.strokeId);
+              useDesignStore.getState().selectStroke(id, e.nativeEvent.shiftKey);
             }}
             onClick={(e) => {
               e.stopPropagation();
@@ -714,7 +777,7 @@ function DesignMesh() {
       {primaryId && selectedStrokeIds.length > 0 && transformMode === 'translate' && (
         <MoveHandle
           primaryId={primaryId}
-          selectedStrokeIds={selectedStrokeIds}
+          targetIds={transformTargetIds}
           meshRefs={meshRefs}
           primaryRef={primaryRef}
           draggingRef={draggingRef}
@@ -739,7 +802,7 @@ function DesignMesh() {
               primaryStartRef.current.rotation.copy(primary.rotation);
             }
             dragStartRef.current.clear();
-            for (const id of selectedStrokeIds) {
+            for (const id of transformTargetIds) {
               const mesh = meshRefs.current.get(id);
               if (!mesh) continue;
               dragStartRef.current.set(id, {
@@ -750,10 +813,10 @@ function DesignMesh() {
           }}
           onObjectChange={() => {
             const primary = primaryRef.current;
-            if (!primary || !primaryId || selectedStrokeIds.length <= 1) return;
+            if (!primary || !primaryId || transformTargetIds.length <= 1) return;
             applyDeltaToSelection(
               primaryId,
-              selectedStrokeIds,
+              transformTargetIds,
               meshRefs.current,
               dragStartRef.current,
               primaryStartRef.current,
@@ -969,13 +1032,9 @@ export function Preview3D() {
         gl={{ antialias: true, alpha: true }}
         className="preview-canvas"
         onPointerMissed={() => {
-          // Keep single-shape selection so the move handle stays available
-          const { strokes, selectedStrokeIds, selectStroke } = useDesignStore.getState();
-          const count = strokes.filter(
-            (s) => s.tool !== 'eraser' && s.color !== 'transparent' && s.points.length >= 1,
-          ).length;
-          if (count <= 1) return;
-          if (selectedStrokeIds.length && !aiModelUrl && !avatarEnabled) selectStroke(null);
+          if (!aiModelUrl && !avatarEnabled) {
+            useDesignStore.getState().selectStroke(null);
+          }
         }}
       >
         <XR store={xrStore}>

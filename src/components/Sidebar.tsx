@@ -257,12 +257,13 @@ export function Sidebar({ onNavigate }: SidebarProps) {
           Brush size
           <input
             type="range"
-            min={1}
-            max={20}
+            min={0}
+            max={100}
+            step={1}
             value={brushSize}
             onChange={(e) => setBrushSize(+e.target.value)}
           />
-          <span>{brushSize}px</span>
+          <span>{brushSize}%</span>
         </label>
         <div className="color-picker-block">
           <ColorWheel

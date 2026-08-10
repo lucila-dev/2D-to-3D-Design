@@ -2,6 +2,13 @@ import type { Point, Stroke } from '../types';
 
 export const CANVAS_SIZE = 400;
 
+/** Brush size UI is 0–100%; maps to stroke width in pixels (thin → thick). */
+export function brushPctToWidth(pct: number): number {
+  const t = Math.max(0, Math.min(100, pct)) / 100;
+  // 0% ≈ 1px, 100% ≈ 48px — clear thin-to-thick range
+  return Math.max(1, Math.round(1 + t * 47));
+}
+
 /** Convert pointer position to canvas pixel coords (canvas bitmap is stretched to element box). */
 export function pointerToCanvas(
   clientX: number,
@@ -175,55 +182,127 @@ function strokeBounds2D(stroke: Stroke) {
   };
 }
 
+function pointInPolygon(point: Point, polygon: Point[]): boolean {
+  if (polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x;
+    const yi = polygon[i].y;
+    const xj = polygon[j].x;
+    const yj = polygon[j].y;
+    const intersect =
+      yi > point.y !== yj > point.y &&
+      point.x < ((xj - xi) * (point.y - yi)) / (yj - yi + 1e-12) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function strokeArea(stroke: Stroke): number {
+  const b = strokeBounds2D(stroke);
+  const w = Math.max(b.maxX - b.minX, 1);
+  const h = Math.max(b.maxY - b.minY, 1);
+  return w * h;
+}
+
 function strokeHitTest(stroke: Stroke, point: Point): boolean {
   if (stroke.tool === 'eraser' || stroke.color === 'transparent' || stroke.points.length < 1) {
     return false;
   }
 
-  const pad = Math.max(stroke.width * 2, 14);
+  const pad = Math.max(stroke.width * 1.5, 10);
   const b = strokeBounds2D(stroke);
 
-  // Generous bounding-box hit — primary so separate shapes are easy to click
+  // Quick reject outside padded bounds
   if (
-    point.x >= b.minX - pad &&
-    point.x <= b.maxX + pad &&
-    point.y >= b.minY - pad &&
-    point.y <= b.maxY + pad
+    point.x < b.minX - pad ||
+    point.x > b.maxX + pad ||
+    point.y < b.minY - pad ||
+    point.y > b.maxY + pad
   ) {
-    // Thin lines: require near-segment so empty bbox corners don't steal clicks
+    return false;
+  }
+
+  if (stroke.points.length === 1) {
+    return Math.hypot(point.x - stroke.points[0].x, point.y - stroke.points[0].y) <= pad;
+  }
+
+  if (stroke.tool === 'ellipse') {
+    const cx = (b.minX + b.maxX) / 2;
+    const cy = (b.minY + b.maxY) / 2;
+    const rx = Math.max((b.maxX - b.minX) / 2, 1);
+    const ry = Math.max((b.maxY - b.minY) / 2, 1);
+    const nx = (point.x - cx) / rx;
+    const ny = (point.y - cy) / ry;
+    return nx * nx + ny * ny <= 1;
+  }
+
+  if (stroke.tool === 'rect') {
+    return (
+      point.x >= b.minX &&
+      point.x <= b.maxX &&
+      point.y >= b.minY &&
+      point.y <= b.maxY
+    );
+  }
+
+  if (stroke.tool === 'line' || (!stroke.closed && stroke.tool === 'pen')) {
     const w = b.maxX - b.minX;
     const h = b.maxY - b.minY;
-    const thin = Math.min(w, h) < pad * 1.5 || stroke.tool === 'line' || (!stroke.closed && stroke.tool === 'pen');
-    if (!thin) return true;
-
-    if (stroke.tool === 'ellipse') {
-      const cx = (b.minX + b.maxX) / 2;
-      const cy = (b.minY + b.maxY) / 2;
-      const rx = Math.max(w / 2, 1) + pad;
-      const ry = Math.max(h / 2, 1) + pad;
-      const nx = (point.x - cx) / rx;
-      const ny = (point.y - cy) / ry;
-      return nx * nx + ny * ny <= 1;
+    const thin = Math.min(w, h) < pad * 1.5 || stroke.tool === 'line';
+    if (thin || !stroke.closed) {
+      for (let i = 1; i < stroke.points.length; i++) {
+        if (distToSegment(point, stroke.points[i - 1], stroke.points[i]) <= pad) return true;
+      }
+      return false;
     }
+  }
 
+  // Filled / closed shapes — precise silhouette, not the whole bbox
+  if (stroke.closed || stroke.tool === 'pen') {
+    if (pointInPolygon(point, stroke.points)) return true;
+    // Near the outline still counts (thick brush edge)
     for (let i = 1; i < stroke.points.length; i++) {
-      if (distToSegment(point, stroke.points[i - 1], stroke.points[i]) <= pad) return true;
+      if (distToSegment(point, stroke.points[i - 1], stroke.points[i]) <= pad * 0.75) {
+        return true;
+      }
     }
-    if (stroke.points.length === 1) {
-      return Math.hypot(point.x - stroke.points[0].x, point.y - stroke.points[0].y) <= pad;
+    if (stroke.closed && stroke.points.length >= 2) {
+      if (
+        distToSegment(point, stroke.points[stroke.points.length - 1], stroke.points[0]) <=
+        pad * 0.75
+      ) {
+        return true;
+      }
     }
     return false;
   }
 
-  return false;
+  return (
+    point.x >= b.minX - pad &&
+    point.x <= b.maxX + pad &&
+    point.y >= b.minY - pad &&
+    point.y <= b.maxY + pad
+  );
 }
 
-/** Topmost matching stroke (last drawn wins). */
+/**
+ * Prefer the innermost (smallest) shape under the cursor so nested items
+ * can be selected without always hitting the outer one.
+ */
 export function hitTestStroke(strokes: Stroke[], point: Point): Stroke | null {
-  for (let i = strokes.length - 1; i >= 0; i--) {
-    if (strokeHitTest(strokes[i], point)) return strokes[i];
+  const hits: { stroke: Stroke; index: number; area: number }[] = [];
+  for (let i = 0; i < strokes.length; i++) {
+    if (strokeHitTest(strokes[i], point)) {
+      hits.push({ stroke: strokes[i], index: i, area: strokeArea(strokes[i]) });
+    }
   }
-  return null;
+  if (hits.length === 0) return null;
+  hits.sort((a, b) => {
+    if (a.area !== b.area) return a.area - b.area; // smaller / inner first
+    return b.index - a.index; // then topmost
+  });
+  return hits[0].stroke;
 }
 
 function drawSelectionOutline(ctx: CanvasRenderingContext2D, stroke: Stroke) {
